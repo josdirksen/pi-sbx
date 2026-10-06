@@ -24,6 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { resolveSbxExecutable } from "./cli.ts";
 import { discoverSandboxes, type SbxSandbox } from "./discovery.ts";
+import { findEnvironmentFile, sandboxNameFor, sessionToken, stoppedSandboxNames } from "./lifecycle.ts";
 import { WorkspacePaths } from "./paths.ts";
 import { type DiscoveredSkillPath, resolveHostSkillReadPath } from "./skill-access.ts";
 import { SbxTransport, type SbxExecOptions, type SbxExecResult } from "./transport.ts";
@@ -34,6 +35,9 @@ const ROUTED_TOOLS = new Set(["bash", "edit", "find", "grep", "ls", "read", "wri
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
 const DEFAULT_GREP_LIMIT = 100;
 const MAX_HOST_TOOL_NAMES = 10;
+const SANDBOX_CREATE_TIMEOUT_MS = 10 * 60_000;
+const SANDBOX_REMOVE_TIMEOUT_MS = 2 * 60_000;
+const SANDBOX_PIN_VARIABLE = "PI_SBX_SANDBOX";
 const EXECUTION_TARGET_DESCRIPTION =
 	'Where to execute this tool call. Omit this or use "sandbox" normally. Use "host" only when sandbox execution cannot perform the operation; host execution requires user approval while sandboxing is active.';
 
@@ -342,6 +346,7 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	let transportSandbox: string | undefined;
 	let discoveredSkills: DiscoveredSkillPath[] = [];
 	const approvedHostCalls = new Map<string, string>();
+	let createdSandbox: string | undefined;
 
 	function disposeTransport(): void {
 		transport?.dispose();
@@ -409,6 +414,51 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		disposeTransport();
 		pi.appendEntry<SelectionState>(STATE_ENTRY, { hostFallback: true });
 		updateStatus(ctx);
+	}
+
+	/**
+	 * Create a sandbox for this session when the project declares one in
+	 * sbxenv.yaml. Declining leaves tool calls on the host for this session.
+	 */
+	async function ensureSandbox(ctx: ExtensionContext): Promise<void> {
+		const envFile = findEnvironmentFile(cwd);
+		if (!envFile || !ctx.hasUI) return;
+		const projectDir = path.dirname(envFile);
+		const name = sandboxNameFor(projectDir, sessionToken(ctx.sessionManager.getSessionId()));
+		const approved = await ctx.ui.confirm(
+			"Create sbx sandbox?",
+			`No sandbox mounts ${cwd}.\n\nCreate "${name}" from ${envFile}?\nDeclining runs tool calls on the host for this session.`,
+		);
+		if (!approved) return;
+		ctx.ui.notify(`Creating sbx sandbox ${name}...`, "info");
+		const result = await pi.exec(sbxExecutable, ["env", "create", "--auto-approve", "--name", name], {
+			cwd: projectDir,
+			timeout: SANDBOX_CREATE_TIMEOUT_MS,
+		});
+		if (result.killed || result.code !== 0) {
+			const detail = (result.stderr || result.stdout).trim() || `exit code ${result.code}`;
+			ctx.ui.notify(`Could not create sandbox ${name}: ${detail}`, "error");
+			return;
+		}
+		createdSandbox = name;
+		await discover(ctx);
+		selectedName = sandboxes.find((sandbox) => sandbox.name === name)?.name;
+	}
+
+	/** Offer to remove this extension's sandboxes left behind by earlier sessions. */
+	async function removeAbandonedSandboxes(ctx: ExtensionContext): Promise<void> {
+		const abandoned = stoppedSandboxNames(sandboxes).filter((name) => name !== createdSandbox);
+		if (abandoned.length === 0 || !ctx.hasUI) return;
+		const approved = await ctx.ui.confirm(
+			"Remove abandoned sbx sandboxes?",
+			`These stopped sandboxes are left over from earlier sessions:\n\n${abandoned.join("\n")}`,
+		);
+		if (!approved) return;
+		const result = await pi.exec(sbxExecutable, ["rm", "--force", ...abandoned], { timeout: SANDBOX_REMOVE_TIMEOUT_MS });
+		if (result.killed || result.code !== 0) {
+			ctx.ui.notify(`Could not remove ${abandoned.join(", ")}: ${(result.stderr || result.stdout).trim()}`, "warning");
+		}
+		await discover(ctx);
 	}
 
 	function requireApprovedHostExecution(toolName: string, id: string, params: Record<string, unknown>): void {
@@ -609,10 +659,16 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		return { systemPrompt: `${systemPrompt}\n\n${environment}` };
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async (event) => {
 		approvedHostCalls.clear();
 		discoveredSkills = [];
 		disposeTransport();
+		// A reload continues the same session, so its sandbox stays.
+		if (event.reason === "reload") return;
+		const name = createdSandbox;
+		createdSandbox = undefined;
+		if (!name) return;
+		await pi.exec(sbxExecutable, ["rm", "--force", name], { timeout: SANDBOX_REMOVE_TIMEOUT_MS });
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -621,7 +677,15 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		try {
 			await discover(ctx);
 			if (sandboxingEnabled) {
-				selectedName = sandboxes.find((sandbox) => sandbox.name === restored?.name)?.name ?? sandboxes[0]?.name;
+				const pinned = process.env[SANDBOX_PIN_VARIABLE];
+				selectedName = sandboxes.find((sandbox) => sandbox.name === (pinned ?? restored?.name))?.name;
+				if (!selectedName && pinned !== undefined) {
+					ctx.ui.notify(`${SANDBOX_PIN_VARIABLE}=${pinned} does not match a sandbox.`, "warning");
+				} else if (!selectedName && restored?.name === undefined) {
+					selectedName = sandboxes[0]?.name;
+				}
+				if (!selectedSandbox() && pinned === undefined) await ensureSandbox(ctx);
+				await removeAbandonedSandboxes(ctx);
 			}
 			updateStatus(ctx);
 			if (!selectedSandbox()) {

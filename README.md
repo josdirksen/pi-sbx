@@ -102,6 +102,20 @@ sbx: my-workspace
 
 Run `/sbx` to refresh discovery and switch the sandbox used for tool execution. Select **Host (disable sandboxing)** in that menu, or run `/sbx off`, to disable sandboxing for the current session. Run `/sbx on` to re-enable the previously selected sandbox.
 
+### Session sandboxes from `sbxenv.yaml`
+
+When no sandbox matches the working directory and the project has an `sbxenv.yaml` at its root, startup asks whether to create one. On approval the extension runs:
+
+```sh
+sbx env create --auto-approve --name pi-<project>-<session>
+```
+
+from the directory holding that file. The name combines the project directory with a short token from the Pi session id. Declining the prompt leaves tool calls on the host for that session, and the prompt returns for the next session.
+
+Set `PI_SBX_SANDBOX` to a sandbox name to pin the session to that sandbox. A pin skips creation and skips the automatic choice of the first matching sandbox.
+
+The sandbox created for a session is removed when that session ends. A reload keeps it, because the session continues. Sandboxes left behind by a killed Pi process are offered for removal at the next startup: only stopped sandboxes whose name starts with `pi-` are listed.
+
 The extension routes these built-in tools through `sbx exec`:
 
 - `bash`
