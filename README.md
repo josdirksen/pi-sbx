@@ -104,17 +104,19 @@ Run `/sbx` to refresh discovery and switch the sandbox used for tool execution. 
 
 ### Session sandboxes from `sbxenv.yaml`
 
-When no sandbox matches the working directory and the project has an `sbxenv.yaml` at its root, startup asks whether to create one. On approval the extension runs:
+Every session gets its own sandbox. When the project has an `sbxenv.yaml` at its root, startup creates one without asking:
 
 ```sh
 sbx env create --auto-approve --name pi-<project>-<session>
 ```
 
-from the directory holding that file. The name combines the project directory with a short token from the Pi session id. Declining the prompt leaves tool calls on the host for that session, and the prompt returns for the next session.
+from the directory holding that file. The name combines the project directory with a short token from the Pi session id, so parallel sessions never share an engine, a port, or a container set, and a reload finds the same sandbox instead of making a second one.
 
-Set `PI_SBX_SANDBOX` to a sandbox name to pin the session to that sandbox. A pin skips creation and skips the automatic choice of the first matching sandbox.
+Without an `sbxenv.yaml`, the session uses a sandbox that already mounts the working directory, when one exists.
 
-The sandbox created for a session is removed when that session ends. A reload keeps it, because the session continues. Sandboxes left behind by a killed Pi process are offered for removal at the next startup: only stopped sandboxes whose name starts with `pi-` are listed.
+Set `PI_SBX_SANDBOX` to a sandbox name to pin the session to that sandbox. A pin skips creation entirely.
+
+A sandbox is not removed when its session ends. The coordinator closes them with the `sbx_cleanup` tool, which lists the running `pi-*` sandboxes other than the caller's own and asks the user before removing them. Without an interactive UI it reports the list and removes nothing.
 
 The extension routes these built-in tools through `sbx exec`:
 

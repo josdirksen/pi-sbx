@@ -37,10 +37,13 @@ export function findEnvironmentFile(dir: string): string | undefined {
 	}
 }
 
-/** Names of this extension's sandboxes that are not running. */
-export function stoppedSandboxNames(sandboxes: { name: string; status?: string }[]): string[] {
+/** Names of this extension's running sandboxes, excluding `keep`. */
+export function leftoverSandboxNames(sandboxes: { name: string; status?: string }[], keep?: string): string[] {
 	return sandboxes
-		.filter((sandbox) => sandbox.name.startsWith(SANDBOX_NAME_PREFIX) && sandbox.status !== "running")
+		.filter(
+			(sandbox) =>
+				sandbox.name.startsWith(SANDBOX_NAME_PREFIX) && sandbox.status === "running" && sandbox.name !== keep,
+		)
 		.map((sandbox) => sandbox.name)
 		.sort();
 }

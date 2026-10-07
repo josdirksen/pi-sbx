@@ -65,6 +65,35 @@ export function parseMatchingSandboxes(
 		});
 }
 
+/** Every sandbox the sbx daemon knows about, without workspace matching. */
+export async function listSandboxes(
+	exec: ExtensionAPI["exec"],
+	executable: string,
+): Promise<SbxSandbox[]> {
+	const result = await exec(executable, ["ls", "--json"], { timeout: 10_000 });
+	if (result.code !== 0 || result.killed) {
+		throw new Error(
+			result.stderr.trim() ||
+				`${executable} ls --json ${result.killed ? "timed out" : `exited with code ${result.code}`}`,
+		);
+	}
+	return parseSandboxList(result.stdout)
+		.map((value): SbxSandbox | undefined => {
+			if (typeof value.name !== "string") return undefined;
+			return {
+				name: value.name,
+				id: typeof value.id === "string" ? value.id : undefined,
+				agent: typeof value.agent === "string" ? value.agent : undefined,
+				status: typeof value.status === "string" ? value.status : undefined,
+				workspaces: Array.isArray(value.workspaces)
+					? value.workspaces.filter((workspace): workspace is string => typeof workspace === "string")
+					: [],
+				mounts: [],
+			};
+		})
+		.filter((value): value is SbxSandbox => value !== undefined);
+}
+
 export async function discoverSandboxes(
 	exec: ExtensionAPI["exec"],
 	executable: string,

@@ -5,9 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import {
 	findEnvironmentFile,
+	leftoverSandboxNames,
 	sandboxNameFor,
 	sessionToken,
-	stoppedSandboxNames,
 } from "../extensions/pi-sbx/lifecycle.ts";
 
 test("builds a sandbox name from the project directory and the session token", () => {
@@ -31,12 +31,16 @@ test("finds the nearest sbxenv.yaml above the working directory", () => {
 	assert.equal(findEnvironmentFile(path.join(root, "missing-dir")), path.join(root, "sbxenv.yaml"));
 });
 
-test("lists only stopped sandboxes created by this extension", () => {
-	const stopped = stoppedSandboxNames([
-		{ name: "pi-repo-a1b2", status: "stopped" },
-		{ name: "pi-repo-c3d4", status: "stopped" },
-		{ name: "pi-repo-live", status: "running" },
-		{ name: "shell-abcd", status: "stopped" },
-	]);
-	assert.deepEqual(stopped, ["pi-repo-a1b2", "pi-repo-c3d4"]);
+test("lists only running sandboxes created by this extension, excluding the session's own", () => {
+	const leftovers = leftoverSandboxNames(
+		[
+			{ name: "pi-repo-a1b2", status: "running" },
+			{ name: "pi-repo-c3d4", status: "running" },
+			{ name: "pi-repo-mine", status: "running" },
+			{ name: "pi-repo-stopped", status: "stopped" },
+			{ name: "shell-abcd", status: "running" },
+		],
+		"pi-repo-mine",
+	);
+	assert.deepEqual(leftovers, ["pi-repo-a1b2", "pi-repo-c3d4"]);
 });

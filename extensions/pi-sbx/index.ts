@@ -23,8 +23,8 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { resolveSbxExecutable } from "./cli.ts";
-import { discoverSandboxes, type SbxSandbox } from "./discovery.ts";
-import { findEnvironmentFile, sandboxNameFor, sessionToken, stoppedSandboxNames } from "./lifecycle.ts";
+import { discoverSandboxes, listSandboxes, type SbxSandbox } from "./discovery.ts";
+import { findEnvironmentFile, leftoverSandboxNames, sandboxNameFor, sessionToken } from "./lifecycle.ts";
 import { WorkspacePaths } from "./paths.ts";
 import { type DiscoveredSkillPath, resolveHostSkillReadPath } from "./skill-access.ts";
 import { SbxTransport, type SbxExecOptions, type SbxExecResult } from "./transport.ts";
@@ -346,7 +346,6 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	let transportSandbox: string | undefined;
 	let discoveredSkills: DiscoveredSkillPath[] = [];
 	const approvedHostCalls = new Map<string, string>();
-	let createdSandbox: string | undefined;
 
 	function disposeTransport(): void {
 		transport?.dispose();
@@ -417,19 +416,29 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Create a sandbox for this session when the project declares one in
-	 * sbxenv.yaml. Declining leaves tool calls on the host for this session.
+	 * Select the sandbox that belongs to this session, or create it.
+	 *
+	 * Every session gets its own sandbox, so parallel sessions never share an
+	 * engine, a port, or a container. The name is derived from the project and
+	 * the session id, so a reload finds the same sandbox instead of making a
+	 * second one. Sandboxes left behind are closed by the coordinator through
+	 * the sbx_cleanup tool.
 	 */
-	async function ensureSandbox(ctx: ExtensionContext): Promise<void> {
+	async function selectOrCreateSessionSandbox(ctx: ExtensionContext): Promise<void> {
 		const envFile = findEnvironmentFile(cwd);
-		if (!envFile || !ctx.hasUI) return;
+		if (!envFile) {
+			// No project environment file to create from: use a sandbox that
+			// already mounts this workspace, if one exists.
+			selectedName = sandboxes[0]?.name;
+			return;
+		}
 		const projectDir = path.dirname(envFile);
 		const name = sandboxNameFor(projectDir, sessionToken(ctx.sessionManager.getSessionId()));
-		const approved = await ctx.ui.confirm(
-			"Create sbx sandbox?",
-			`No sandbox mounts ${cwd}.\n\nCreate "${name}" from ${envFile}?\nDeclining runs tool calls on the host for this session.`,
-		);
-		if (!approved) return;
+		const existing = sandboxes.find((sandbox) => sandbox.name === name)?.name;
+		if (existing) {
+			selectedName = existing;
+			return;
+		}
 		ctx.ui.notify(`Creating sbx sandbox ${name}...`, "info");
 		const result = await pi.exec(sbxExecutable, ["env", "create", "--auto-approve", "--name", name], {
 			cwd: projectDir,
@@ -440,25 +449,8 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`Could not create sandbox ${name}: ${detail}`, "error");
 			return;
 		}
-		createdSandbox = name;
 		await discover(ctx);
 		selectedName = sandboxes.find((sandbox) => sandbox.name === name)?.name;
-	}
-
-	/** Offer to remove this extension's sandboxes left behind by earlier sessions. */
-	async function removeAbandonedSandboxes(ctx: ExtensionContext): Promise<void> {
-		const abandoned = stoppedSandboxNames(sandboxes).filter((name) => name !== createdSandbox);
-		if (abandoned.length === 0 || !ctx.hasUI) return;
-		const approved = await ctx.ui.confirm(
-			"Remove abandoned sbx sandboxes?",
-			`These stopped sandboxes are left over from earlier sessions:\n\n${abandoned.join("\n")}`,
-		);
-		if (!approved) return;
-		const result = await pi.exec(sbxExecutable, ["rm", "--force", ...abandoned], { timeout: SANDBOX_REMOVE_TIMEOUT_MS });
-		if (result.killed || result.code !== 0) {
-			ctx.ui.notify(`Could not remove ${abandoned.join(", ")}: ${(result.stderr || result.stdout).trim()}`, "warning");
-		}
-		await discover(ctx);
 	}
 
 	function requireApprovedHostExecution(toolName: string, id: string, params: Record<string, unknown>): void {
@@ -610,6 +602,55 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "sbx_cleanup",
+		label: "sbx cleanup",
+		description:
+			"List the sbx sandboxes left running by finished pi sessions and ask the user whether to remove them. Call this after a worker subagent finishes. The sandbox this session uses is never listed.",
+		promptSnippet: "List leftover sbx sandboxes and ask before removing them",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			let listed: SbxSandbox[];
+			try {
+				listed = await listSandboxes(pi.exec.bind(pi), sbxExecutable);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				return { content: [{ type: "text" as const, text: `Could not list sbx sandboxes: ${detail}` }], details: {} };
+			}
+			const leftovers = leftoverSandboxNames(listed, selectedSandbox());
+			if (leftovers.length === 0) {
+				return { content: [{ type: "text" as const, text: "No leftover sbx sandboxes are running." }], details: {} };
+			}
+			if (!ctx.hasUI) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Leftover sbx sandboxes are running, but there is no interactive UI to confirm removal:\n${leftovers.join("\n")}`,
+						},
+					],
+					details: {},
+				};
+			}
+			const approved = await ctx.ui.confirm(
+				"Remove leftover sbx sandboxes?",
+				`These sandboxes are still running:\n\n${leftovers.join("\n")}`,
+			);
+			if (!approved) {
+				return { content: [{ type: "text" as const, text: `Kept ${leftovers.length} sandbox(es): ${leftovers.join(", ")}` }], details: {} };
+			}
+			const result = await pi.exec(sbxExecutable, ["rm", "--force", ...leftovers], {
+				timeout: SANDBOX_REMOVE_TIMEOUT_MS,
+			});
+			if (result.killed || result.code !== 0) {
+				const detail = (result.stderr || result.stdout).trim() || `exit code ${result.code}`;
+				return { content: [{ type: "text" as const, text: `Could not remove ${leftovers.join(", ")}: ${detail}` }], details: {} };
+			}
+			await discover(ctx);
+			return { content: [{ type: "text" as const, text: `Removed ${leftovers.length} sandbox(es): ${leftovers.join(", ")}` }], details: {} };
+		},
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (!selectedSandbox() || !ROUTED_TOOLS.has(event.toolName)) return;
 		const input = event.input as Record<string, unknown>;
@@ -659,16 +700,10 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		return { systemPrompt: `${systemPrompt}\n\n${environment}` };
 	});
 
-	pi.on("session_shutdown", async (event) => {
+	pi.on("session_shutdown", () => {
 		approvedHostCalls.clear();
 		discoveredSkills = [];
 		disposeTransport();
-		// A reload continues the same session, so its sandbox stays.
-		if (event.reason === "reload") return;
-		const name = createdSandbox;
-		createdSandbox = undefined;
-		if (!name) return;
-		await pi.exec(sbxExecutable, ["rm", "--force", name], { timeout: SANDBOX_REMOVE_TIMEOUT_MS });
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -678,14 +713,12 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 			await discover(ctx);
 			if (sandboxingEnabled) {
 				const pinned = process.env[SANDBOX_PIN_VARIABLE];
-				selectedName = sandboxes.find((sandbox) => sandbox.name === (pinned ?? restored?.name))?.name;
-				if (!selectedName && pinned !== undefined) {
-					ctx.ui.notify(`${SANDBOX_PIN_VARIABLE}=${pinned} does not match a sandbox.`, "warning");
-				} else if (!selectedName && restored?.name === undefined) {
-					selectedName = sandboxes[0]?.name;
+				if (pinned !== undefined) {
+					selectedName = sandboxes.find((sandbox) => sandbox.name === pinned)?.name;
+					if (!selectedName) ctx.ui.notify(`${SANDBOX_PIN_VARIABLE}=${pinned} does not match a sandbox.`, "warning");
+				} else {
+					await selectOrCreateSessionSandbox(ctx);
 				}
-				if (!selectedSandbox() && pinned === undefined) await ensureSandbox(ctx);
-				await removeAbandonedSandboxes(ctx);
 			}
 			updateStatus(ctx);
 			if (!selectedSandbox()) {
