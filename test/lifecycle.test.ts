@@ -31,13 +31,12 @@ test("finds the nearest sbxenv.yaml above the working directory", () => {
 	assert.equal(findEnvironmentFile(path.join(root, "missing-dir")), path.join(root, "sbxenv.yaml"));
 });
 
-test("lists only running sandboxes created by this extension, excluding the session's own", () => {
+test("lists this extension's sandboxes from other sessions, excluding the session's own", () => {
 	const leftovers = leftoverSandboxNames(
 		[
-			{ name: "pi-repo-a1b2", status: "running" },
+			{ name: "pi-repo-a1b2", status: "stopped" },
 			{ name: "pi-repo-c3d4", status: "running" },
 			{ name: "pi-repo-mine", status: "running" },
-			{ name: "pi-repo-stopped", status: "stopped" },
 			{ name: "shell-abcd", status: "running" },
 		],
 		"pi-repo-mine",

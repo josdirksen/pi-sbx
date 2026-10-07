@@ -621,12 +621,15 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 			if (leftovers.length === 0) {
 				return { content: [{ type: "text" as const, text: "No leftover sbx sandboxes are running." }], details: {} };
 			}
+			const described = leftovers
+				.map((name) => `${name} (${listed.find((sandbox) => sandbox.name === name)?.status ?? "unknown"})`)
+				.join("\n");
 			if (!ctx.hasUI) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Leftover sbx sandboxes are running, but there is no interactive UI to confirm removal:\n${leftovers.join("\n")}`,
+							text: `Leftover sbx sandboxes exist, but there is no interactive UI to confirm removal:\n${described}`,
 						},
 					],
 					details: {},
@@ -634,7 +637,7 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 			}
 			const approved = await ctx.ui.confirm(
 				"Remove leftover sbx sandboxes?",
-				`These sandboxes are still running:\n\n${leftovers.join("\n")}`,
+				`These sandboxes belong to other sessions:\n\n${described}`,
 			);
 			if (!approved) {
 				return { content: [{ type: "text" as const, text: `Kept ${leftovers.length} sandbox(es): ${leftovers.join(", ")}` }], details: {} };

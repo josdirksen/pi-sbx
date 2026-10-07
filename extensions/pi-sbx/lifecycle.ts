@@ -37,13 +37,17 @@ export function findEnvironmentFile(dir: string): string | undefined {
 	}
 }
 
-/** Names of this extension's running sandboxes, excluding `keep`. */
+/**
+ * Names of this extension's sandboxes left over from other sessions,
+ * excluding `keep`.
+ *
+ * The status is not filtered: sbx stops an idle sandbox by itself, so a
+ * leftover is often stopped rather than running. The caller reports the status
+ * and lets the user decide.
+ */
 export function leftoverSandboxNames(sandboxes: { name: string; status?: string }[], keep?: string): string[] {
 	return sandboxes
-		.filter(
-			(sandbox) =>
-				sandbox.name.startsWith(SANDBOX_NAME_PREFIX) && sandbox.status === "running" && sandbox.name !== keep,
-		)
+		.filter((sandbox) => sandbox.name.startsWith(SANDBOX_NAME_PREFIX) && sandbox.name !== keep)
 		.map((sandbox) => sandbox.name)
 		.sort();
 }
