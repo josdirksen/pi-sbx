@@ -116,7 +116,9 @@ Without an `sbxenv.yaml`, the session uses a sandbox that already mounts the wor
 
 Set `PI_SBX_SANDBOX` to a sandbox name to pin the session to that sandbox. A pin skips creation entirely.
 
-A sandbox is not removed when its session ends. The coordinator closes them with the `sbx_cleanup` tool, which lists the running `pi-*` sandboxes other than the caller's own and asks the user before removing them. Without an interactive UI it reports the list and removes nothing.
+A worker session removes its own sandbox with the `sbx_kill` tool as its last step, and reports the result to its parent. If a worker finishes without calling it, the extension removes the sandbox at session end: a session with the `PI_SUBAGENT_ID` marker set is treated as a worker. A coordinator session keeps its sandbox.
+
+The coordinator verifies that removal with `sbx_cleanup <name>`, which removes the sandbox if it is still there and reports which of the two happened. Called without a name, `sbx_cleanup` only lists the sandboxes other sessions left behind. It removes nothing and needs no user input.
 
 The extension routes these built-in tools through `sbx exec`:
 

@@ -38,6 +38,7 @@ const MAX_HOST_TOOL_NAMES = 10;
 const SANDBOX_CREATE_TIMEOUT_MS = 10 * 60_000;
 const SANDBOX_REMOVE_TIMEOUT_MS = 2 * 60_000;
 const SANDBOX_PIN_VARIABLE = "PI_SBX_SANDBOX";
+const SUBAGENT_MARKER = "PI_SUBAGENT_ID";
 const EXECUTION_TARGET_DESCRIPTION =
 	'Where to execute this tool call. Omit this or use "sandbox" normally. Use "host" only when sandbox execution cannot perform the operation; host execution requires user approval while sandboxing is active.';
 
@@ -606,10 +607,14 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		name: "sbx_cleanup",
 		label: "sbx cleanup",
 		description:
-			"List the sbx sandboxes left running by finished pi sessions and ask the user whether to remove them. Call this after a worker subagent finishes. The sandbox this session uses is never listed.",
-		promptSnippet: "List leftover sbx sandboxes and ask before removing them",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			"Check the sbx sandboxes left behind by other sessions. Pass the name a worker reported to verify and remove that sandbox. With no name, only list what is left; nothing is removed and no user input is needed.",
+		promptSnippet: "Check or remove a sandbox left behind by another session",
+		parameters: Type.Object({
+			name: Type.Optional(
+				Type.String({ description: "Sandbox to verify and remove. Omit to only list the leftovers." }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate) {
 			let listed: SbxSandbox[];
 			try {
 				listed = await listSandboxes(pi.exec.bind(pi), sbxExecutable);
@@ -617,40 +622,71 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 				const detail = error instanceof Error ? error.message : String(error);
 				return { content: [{ type: "text" as const, text: `Could not list sbx sandboxes: ${detail}` }], details: {} };
 			}
+			const target = (params as { name?: string }).name;
+			if (target) {
+				if (!listed.some((sandbox) => sandbox.name === target)) {
+					return { content: [{ type: "text" as const, text: `Sandbox ${target} is already gone.` }], details: {} };
+				}
+				const removed = await pi.exec(sbxExecutable, ["rm", "--force", target], {
+					timeout: SANDBOX_REMOVE_TIMEOUT_MS,
+				});
+				if (removed.killed || removed.code !== 0) {
+					const detail = (removed.stderr || removed.stdout).trim() || `exit code ${removed.code}`;
+					return { content: [{ type: "text" as const, text: `Could not remove ${target}: ${detail}` }], details: {} };
+				}
+				return { content: [{ type: "text" as const, text: `Removed sandbox ${target}, which was still present.` }], details: {} };
+			}
 			const leftovers = leftoverSandboxNames(listed, selectedSandbox());
 			if (leftovers.length === 0) {
-				return { content: [{ type: "text" as const, text: "No leftover sbx sandboxes are running." }], details: {} };
+				return { content: [{ type: "text" as const, text: "No leftover sbx sandboxes." }], details: {} };
 			}
 			const described = leftovers
 				.map((name) => `${name} (${listed.find((sandbox) => sandbox.name === name)?.status ?? "unknown"})`)
 				.join("\n");
-			if (!ctx.hasUI) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Leftover sbx sandboxes exist, but there is no interactive UI to confirm removal:\n${described}`,
-						},
-					],
-					details: {},
-				};
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Sbx sandboxes from other sessions:\n${described}\n\nNothing was removed. Pass a name to remove one.`,
+					},
+				],
+				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "sbx_kill",
+		label: "sbx kill",
+		description:
+			"Remove the sbx sandbox this session uses. A worker calls this as its last step, then reports the result to its parent.",
+		promptSnippet: "Remove this session's own sbx sandbox when the work is done",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const name = selectedSandbox();
+			if (!name) {
+				return { content: [{ type: "text" as const, text: "This session has no sandbox to remove." }], details: {} };
 			}
-			const approved = await ctx.ui.confirm(
-				"Remove leftover sbx sandboxes?",
-				`These sandboxes belong to other sessions:\n\n${described}`,
-			);
-			if (!approved) {
-				return { content: [{ type: "text" as const, text: `Kept ${leftovers.length} sandbox(es): ${leftovers.join(", ")}` }], details: {} };
-			}
-			const result = await pi.exec(sbxExecutable, ["rm", "--force", ...leftovers], {
+			disposeTransport();
+			const result = await pi.exec(sbxExecutable, ["rm", "--force", name], {
 				timeout: SANDBOX_REMOVE_TIMEOUT_MS,
 			});
 			if (result.killed || result.code !== 0) {
 				const detail = (result.stderr || result.stdout).trim() || `exit code ${result.code}`;
-				return { content: [{ type: "text" as const, text: `Could not remove ${leftovers.join(", ")}: ${detail}` }], details: {} };
+				return { content: [{ type: "text" as const, text: `Could not remove sandbox ${name}: ${detail}` }], details: {} };
 			}
-			await discover(ctx);
-			return { content: [{ type: "text" as const, text: `Removed ${leftovers.length} sandbox(es): ${leftovers.join(", ")}` }], details: {} };
+			sandboxingEnabled = false;
+			selectedName = undefined;
+			updateStatus(ctx);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Removed sandbox ${name}. Tool calls in this session now run on the host.`,
+					},
+				],
+				details: {},
+			};
 		},
 	});
 
@@ -703,10 +739,17 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		return { systemPrompt: `${systemPrompt}\n\n${environment}` };
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		approvedHostCalls.clear();
 		discoveredSkills = [];
 		disposeTransport();
+		// A worker removes its sandbox itself through sbx_kill. This is the safety
+		// net for a worker that finished without calling it. A coordinator session
+		// has no subagent marker and keeps its sandbox.
+		if (!process.env[SUBAGENT_MARKER]) return;
+		const name = selectedSandbox();
+		if (!name) return;
+		await pi.exec(sbxExecutable, ["rm", "--force", name], { timeout: SANDBOX_REMOVE_TIMEOUT_MS });
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
