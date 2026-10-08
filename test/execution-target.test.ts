@@ -21,16 +21,17 @@ interface Harness {
 	tools: Map<string, RegisteredTool>;
 	handlers: Map<string, Handler[]>;
 	context: ExtensionContext;
-	confirmations: Array<{ title: string; message: string }>;
+	approvals: Array<{ title: string; options: string[] }>;
 	setApproval(approved: boolean): void;
+	setApprovalChoice(choice: string | undefined): void;
 	emit(eventName: string, event: any): Promise<any[]>;
 }
 
 function createHarness(options: { sandbox?: boolean; hasUI?: boolean; activeTools?: string[] } = {}): Harness {
 	const tools = new Map<string, RegisteredTool>();
 	const handlers = new Map<string, Handler[]>();
-	const confirmations: Array<{ title: string; message: string }> = [];
-	let approved = true;
+	const approvals: Array<{ title: string; options: string[] }> = [];
+	let approvalChoice: string | undefined = "Allow once";
 	const sandbox = options.sandbox ?? true;
 
 	const context = {
@@ -44,11 +45,11 @@ function createHarness(options: { sandbox?: boolean; hasUI?: boolean; activeTool
 			},
 			setStatus: () => {},
 			notify: () => {},
-			select: async () => undefined,
-			confirm: async (title: string, message: string) => {
-				confirmations.push({ title, message });
-				return approved;
+			select: async (title: string, options: string[]) => {
+				approvals.push({ title, options });
+				return approvalChoice;
 			},
+			confirm: async () => false,
 		},
 	} as unknown as ExtensionContext;
 
@@ -81,9 +82,12 @@ function createHarness(options: { sandbox?: boolean; hasUI?: boolean; activeTool
 		tools,
 		handlers,
 		context,
-		confirmations,
+		approvals,
 		setApproval(value) {
-			approved = value;
+			approvalChoice = value ? "Allow once" : "Deny";
+		},
+		setApprovalChoice(value) {
+			approvalChoice = value;
 		},
 		async emit(eventName, event) {
 			const results = [];
@@ -141,8 +145,13 @@ test("approves one exact host call and executes it on the host", async () => {
 
 	const [gateResult] = await harness.emit("tool_call", toolCall("read", "approved-read", input));
 	assert.equal(gateResult, undefined);
-	assert.equal(harness.confirmations.length, 1);
-	assert.equal(harness.confirmations[0]?.title, "Allow host execution?");
+	assert.equal(harness.approvals.length, 1);
+	assert.deepEqual(harness.approvals[0]?.options, [
+		"Allow once",
+		"Allow all host calls for this session",
+		"Deny",
+	]);
+	assert.match(harness.approvals[0]?.title ?? "", /outside the selected sbx sandbox/);
 
 	const result = await harness.tools.get("read")?.execute(
 		"approved-read",
@@ -182,7 +191,35 @@ test("routes every approved built-in tool to the host", async (t) => {
 	}
 
 	assert.equal(await readFile(filePath, "utf8"), "beta\n");
-	assert.equal(harness.confirmations.length, calls.length);
+	assert.equal(harness.approvals.length, calls.length);
+});
+
+test("allows every later host call after the session-wide choice", async () => {
+	const harness = createHarness();
+	await startHarness(harness);
+	harness.setApprovalChoice("Allow all host calls for this session");
+
+	const [first] = await harness.emit(
+		"tool_call",
+		toolCall("read", "session-first", { path: "README.md", execution_target: "host" }),
+	);
+	const [second] = await harness.emit(
+		"tool_call",
+		toolCall("read", "session-second", { path: "README.md", execution_target: "host" }),
+	);
+
+	assert.equal(first, undefined);
+	assert.equal(second, undefined);
+	assert.equal(harness.approvals.length, 1);
+
+	const result = await harness.tools.get("read")?.execute(
+		"session-second",
+		{ path: "README.md", execution_target: "host" },
+		undefined,
+		undefined,
+		harness.context,
+	);
+	assert.match(result.content[0].text, /pi-sbx/);
 });
 
 test("does not prompt for normal sandbox calls and allows extension tools on the host", async () => {
@@ -199,7 +236,7 @@ test("does not prompt for normal sandbox calls and allows extension tools on the
 	assert.equal(defaultResult, undefined);
 	assert.equal(explicitResult, undefined);
 	assert.equal(extensionResult, undefined);
-	assert.equal(harness.confirmations.length, 0);
+	assert.equal(harness.approvals.length, 0);
 });
 
 test("blocks host execution when the user denies approval", async () => {
@@ -213,7 +250,7 @@ test("blocks host execution when the user denies approval", async () => {
 	);
 
 	assert.deepEqual(result, { block: true, reason: "Host execution was denied by the user." });
-	assert.equal(harness.confirmations.length, 1);
+	assert.equal(harness.approvals.length, 1);
 });
 
 test("fails closed when host approval cannot be displayed", async () => {
@@ -229,7 +266,7 @@ test("fails closed when host approval cannot be displayed", async () => {
 		block: true,
 		reason: "Host execution requires user approval, but no interactive UI is available.",
 	});
-	assert.equal(harness.confirmations.length, 0);
+	assert.equal(harness.approvals.length, 0);
 });
 
 test("rejects execution when the approved host arguments were changed", async () => {
@@ -261,7 +298,7 @@ test("does not ask for approval in host fallback mode", async () => {
 
 	const [gateResult] = await harness.emit("tool_call", toolCall("read", "fallback-read", input));
 	assert.equal(gateResult, undefined);
-	assert.equal(harness.confirmations.length, 0);
+	assert.equal(harness.approvals.length, 0);
 
 	const result = await harness.tools.get("read")?.execute(
 		"fallback-read",
@@ -304,7 +341,7 @@ test("reads Pi-discovered skills from the host while sandboxing is active", asyn
 		harness.context,
 	);
 	assert.match(result.content[0].text, /Discovered host skill/);
-	assert.equal(harness.confirmations.length, 0);
+	assert.equal(harness.approvals.length, 0);
 });
 
 test("adds opinionated host-execution guidance only when a sandbox is active", async () => {

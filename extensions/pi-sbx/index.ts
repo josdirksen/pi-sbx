@@ -39,6 +39,9 @@ const SANDBOX_CREATE_TIMEOUT_MS = 10 * 60_000;
 const SANDBOX_REMOVE_TIMEOUT_MS = 2 * 60_000;
 const SANDBOX_PIN_VARIABLE = "PI_SBX_SANDBOX";
 const SUBAGENT_MARKER = "PI_SUBAGENT_ID";
+const HOST_APPROVAL_ONCE = "Allow once";
+const HOST_APPROVAL_SESSION = "Allow all host calls for this session";
+const HOST_APPROVAL_DENY = "Deny";
 const EXECUTION_TARGET_DESCRIPTION =
 	'Where to execute this tool call. Omit this or use "sandbox" normally. Use "host" only when sandbox execution cannot perform the operation; host execution requires user approval while sandboxing is active.';
 
@@ -347,6 +350,7 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	let transportSandbox: string | undefined;
 	let discoveredSkills: DiscoveredSkillPath[] = [];
 	const approvedHostCalls = new Map<string, string>();
+	let allowAllHostCalls = false;
 
 	function disposeTransport(): void {
 		transport?.dispose();
@@ -383,8 +387,9 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
+		const suffix = allowAllHostCalls ? " · host calls allowed" : "";
 		if (sandboxingEnabled && selectedName) {
-			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("muted", `sbx: ${selectedName}`));
+			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("muted", `sbx: ${selectedName}${suffix}`));
 		} else {
 			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("warning", "sbx: host fallback"));
 		}
@@ -694,14 +699,23 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 		if (!selectedSandbox() || !ROUTED_TOOLS.has(event.toolName)) return;
 		const input = event.input as Record<string, unknown>;
 		if (input.execution_target !== "host") return;
-		if (!ctx.hasUI) {
-			return { block: true, reason: "Host execution requires user approval, but no interactive UI is available." };
+		if (!allowAllHostCalls) {
+			if (!ctx.hasUI) {
+				return { block: true, reason: "Host execution requires user approval, but no interactive UI is available." };
+			}
+			const choice = await ctx.ui.select(hostApprovalMessage(event.toolName, input, cwd), [
+				HOST_APPROVAL_ONCE,
+				HOST_APPROVAL_SESSION,
+				HOST_APPROVAL_DENY,
+			]);
+			if (choice === HOST_APPROVAL_SESSION) {
+				allowAllHostCalls = true;
+				ctx.ui.notify("Host execution is now allowed for the rest of this session.", "warning");
+				updateStatus(ctx);
+			} else if (choice !== HOST_APPROVAL_ONCE) {
+				return { block: true, reason: "Host execution was denied by the user." };
+			}
 		}
-		const approved = await ctx.ui.confirm(
-			"Allow host execution?",
-			hostApprovalMessage(event.toolName, input, cwd),
-		);
-		if (!approved) return { block: true, reason: "Host execution was denied by the user." };
 		approvedHostCalls.set(event.toolCallId, hostRequestFingerprint(event.toolName, input));
 	});
 
@@ -755,6 +769,8 @@ export default function piSbxExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const restored = restoredSelection(ctx);
 		sandboxingEnabled = restored?.hostFallback !== true;
+		// Host approval is granted per session, never carried over.
+		allowAllHostCalls = false;
 		try {
 			await discover(ctx);
 			if (sandboxingEnabled) {
